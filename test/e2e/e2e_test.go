@@ -227,7 +227,7 @@ func TestE2E(t *testing.T) {
 		}
 		defer adminClient.CoreV1().Secrets("openshift-service-cert-signer").Delete("next-service-signer", nil)
 
-		err = CreateCrossSignedInterimCAs(adminClient,
+		_, _, err = CreateCrossSignedInterimCAs(adminClient,
 			"service-serving-cert-signer-signing-key",
 			"openshift-service-cert-signer",
 			"next-service-signer",
@@ -236,6 +236,7 @@ func TestE2E(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error creating cross-signed certs: %v", err)
 		}
+
 	})
 	// TODO: additional tests
 	// - configmap CA bundle injection
@@ -260,65 +261,65 @@ func getSigningSubject(client *kubernetes.Clientset) (pkix.Name, error) {
 	return caCert.Subject, nil
 }
 
-func CreateCrossSignedInterimCAs(client *kubernetes.Clientset, currentCASecretName, currentCASecretNamespace, newCASecretName, newCASecretNamespace string) error {
+func CreateCrossSignedInterimCAs(client *kubernetes.Clientset, currentCASecretName, currentCASecretNamespace, newCASecretName, newCASecretNamespace string) ([]byte, []byte, error) {
 	curCACertDer, curCAKeyDer, err := getTLSCredsFromSecret(client, currentCASecretName, currentCASecretNamespace, "tls.crt", "tls.key")
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	newCACertDer, newCAKeyDer, err := getTLSCredsFromSecret(client, newCASecretName, newCASecretNamespace, "tls.crt", "tls.key")
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	curCABlock, _ := pem.Decode(curCACertDer)
 	curCACert, err := x509.ParseCertificate(curCABlock.Bytes)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	curCAKeyBlock, _ := pem.Decode(curCAKeyDer)
 	curCAKey, err := x509.ParsePKCS1PrivateKey(curCAKeyBlock.Bytes)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	newCABlock, _ := pem.Decode(newCACertDer)
 	newCACert, err := x509.ParseCertificate(newCABlock.Bytes)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	newCAKeyBlock, _ := pem.Decode(newCAKeyDer)
 	newCAKey, err := x509.ParsePKCS1PrivateKey(newCAKeyBlock.Bytes)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// The first cross-signed intermediate has the current CA's public and private key and subject, signed by the new CA key
 	// XXX change auth key ID to new CA auth key
 	firstCrossSigned, err := x509.CreateCertificate(crand.Reader, curCACert, curCACert, curCACert.PublicKey, newCAKey)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	firstCrossSignedCert, err := x509.ParseCertificates(firstCrossSigned)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if len(firstCrossSignedCert) != 1 {
-		return fmt.Errorf("Expected one certificate")
+		return nil, nil, fmt.Errorf("Expected one certificate")
 	}
 
 	firstCrossSignedCApem, err := encodeCertificates(firstCrossSignedCert...)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// XXX
 	curCAPem, err := encodeCertificates(curCACert)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	newCAPem, err := encodeCertificates(newCACert)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	fmt.Printf("current CA PEM\n")
 	fmt.Printf("%s\n", curCAPem)
@@ -333,20 +334,20 @@ func CreateCrossSignedInterimCAs(client *kubernetes.Clientset, currentCASecretNa
 	// The second cross-signed intermediate has the new CA's public and private key and subject, signed by the old CA key
 	secondCrossSigned, err := x509.CreateCertificate(crand.Reader, newCACert, newCACert, newCACert.PublicKey, curCAKey)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	secondCrossSignedCert, err := x509.ParseCertificates(secondCrossSigned)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if len(secondCrossSignedCert) != 1 {
-		return fmt.Errorf("Expected one certificate")
+		return nil, nil, fmt.Errorf("Expected one certificate")
 	}
 
 	secondCrossSignedCApem, err := encodeCertificates(secondCrossSignedCert...)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// XXX
@@ -354,7 +355,7 @@ func CreateCrossSignedInterimCAs(client *kubernetes.Clientset, currentCASecretNa
 	fmt.Printf("%s\n", secondCrossSignedCApem)
 	ioutil.WriteFile("/tmp/second.crt", secondCrossSignedCApem, 0644)
 
-	return nil
+	return firstCrossSignedCApem, secondCrossSignedCApem, nil
 }
 
 func createServiceSignerReplacementCASecret(adminClient *kubernetes.Clientset, caSubject pkix.Name, days int) error {
