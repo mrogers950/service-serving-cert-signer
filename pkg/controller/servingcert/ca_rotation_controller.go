@@ -148,8 +148,8 @@ func (rc *CARotationController) work() bool {
 	return true
 }
 
-// syncService will sync the service with the given key.
-// This function is not meant to be invoked concurrently with the same key.
+// syncCAs updates the signing CA with the replacement, generate cross-signed intermediates for rollover, and update the
+// signing CA bundle configMap with the full bundle.
 func (rc *CARotationController) syncCAs(key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -167,19 +167,26 @@ func (rc *CARotationController) syncCAs(key string) error {
 	if err != nil {
 		return err
 	}
-	caBundleConfigMap := sharedCABundleConfigMap.DeepCopy()
 
 	sharedOldCASecret, err := rc.secretLister.Secrets("openshift-service-cert-signer").Get("service-serving-cert-signer-signing-key")
 	if err != nil {
 		return err
 	}
-	oldCASecret := sharedOldCASecret.DeepCopy()
 
-	if hasSameCert(oldCASecret, newCASecret) {
+	// Don't update if the old and new CA certs are the same - the update has already happened.
+	if hasSameCert(sharedOldCASecret, newCASecret) {
 		return nil
 	}
 
-	// create cross-signed interims
+	// Old and new CA certs need to have the same subject for cross-signing to work.
+	if !hasSameSubject(sharedOldCASecret, newCASecret) {
+		return nil
+	}
+
+	caBundleConfigMap := sharedCABundleConfigMap.DeepCopy()
+	oldCASecret := sharedOldCASecret.DeepCopy()
+
+	// Create cross-signed interims.
 	bundle, signedByOld, err := createInterimCAs(oldCASecret, newCASecret)
 	if err != nil {
 		return err
@@ -194,14 +201,14 @@ func (rc *CARotationController) syncCAs(key string) error {
 		return err
 	}
 
-	// Update CA bundle
+	// Update CA bundle.
 	caBundleConfigMap.Data["cabundle.crt"] = string(bundle)
 	_, err = rc.configMapClient.ConfigMaps("openshift-service-cert-signer").Update(caBundleConfigMap)
 	if err != nil {
 		return err
 	}
 
-	// trigger regeneration
+	// Trigger regeneration by deleting all service signer certificates.
 	return err
 }
 
@@ -215,6 +222,26 @@ func hasSameCert(s1, s2 *v1.Secret) bool {
 		return false
 	}
 	return bytes.Equal(cert1, cert2) && bytes.Equal(key1, key2)
+}
+
+func hasSameSubject(s1, s2 *v1.Secret) bool {
+	cert1Pem, _, err := getCertSecretData(s1)
+	if err != nil {
+		return false
+	}
+	cert2Pem, _, err := getCertSecretData(s2)
+	if err != nil {
+		return false
+	}
+	cert1, err := parsePemCert(cert1Pem)
+	if err != nil {
+		return false
+	}
+	cert2, err := parsePemCert(cert2Pem)
+	if err != nil {
+		return false
+	}
+	return cert1.Subject.String() == cert2.Subject.String()
 }
 
 func getCertSecretData(secret *v1.Secret) ([]byte, []byte, error) {

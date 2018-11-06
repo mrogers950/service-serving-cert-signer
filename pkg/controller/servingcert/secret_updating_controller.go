@@ -17,8 +17,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/openshift/library-go/pkg/crypto"
 	ocontroller "github.com/openshift/library-go/pkg/controller"
+	"github.com/openshift/library-go/pkg/crypto"
 	"github.com/openshift/service-serving-cert-signer/pkg/controller/servingcert/cryptoextensions"
 )
 
@@ -38,6 +38,9 @@ type ServiceServingCertUpdateController struct {
 
 	ca        *crypto.CA
 	dnsSuffix string
+	// The intermediate to append to the serving certificate after rotation
+	intermediate []byte
+
 	// minTimeLeftForCert is how much time is remaining for the serving cert before regenerating it.
 	minTimeLeftForCert time.Duration
 
@@ -184,6 +187,8 @@ func (sc *ServiceServingCertUpdateController) syncSecret(key string) error {
 	dnsName := service.Name + "." + secretCopy.Namespace + ".svc"
 	fqDNSName := dnsName + "." + sc.dnsSuffix
 	certificateLifetime := 365 * 2 // 2 years
+
+	// TODO: Needs to create servingCert with an authKeyId
 	servingCert, err := sc.ca.MakeServerCert(
 		sets.NewString(dnsName, fqDNSName),
 		certificateLifetime,
@@ -192,11 +197,30 @@ func (sc *ServiceServingCertUpdateController) syncSecret(key string) error {
 	if err != nil {
 		return err
 	}
-	secretCopy.Annotations[ServingCertExpiryAnnotation] = servingCert.Certs[0].NotAfter.Format(time.RFC3339)
-	secretCopy.Data[v1.TLSCertKey], secretCopy.Data[v1.TLSPrivateKeyKey], err = servingCert.GetPEMBytes()
+	certBytes, keyBytes, err := servingCert.GetPEMBytes()
 	if err != nil {
 		return err
 	}
+
+	if len(sc.intermediate) == 0 {
+		// Check for a cross-signed intermediate from the CA key rotation process.
+		signingSecret, err := sc.secretLister.Secrets("openshift-service-cert-signer").Get("service-serving-cert-signer-signing-key")
+		if err != nil {
+			return err
+		}
+		if dat, ok := signingSecret.Data["intermediate.crt"]; ok {
+			sc.intermediate = make([]byte, len(dat))
+			copy(sc.intermediate, dat)
+		}
+	}
+	// Append the cross-signed intermediate if any. It goes after the end-entity certificate so servers send it along
+	// when serving.
+	certBytes = append(certBytes, sc.intermediate...)
+
+	secretCopy.Annotations[ServingCertExpiryAnnotation] = servingCert.Certs[0].NotAfter.Format(time.RFC3339)
+	secretCopy.Data[v1.TLSCertKey] = certBytes
+	secretCopy.Data[v1.TLSPrivateKeyKey] = keyBytes
+
 	ocontroller.EnsureOwnerRef(secretCopy, ownerRef(service))
 
 	_, err = sc.secretClient.Secrets(secretCopy.Namespace).Update(secretCopy)

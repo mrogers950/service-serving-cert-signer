@@ -20,8 +20,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/openshift/library-go/pkg/crypto"
 	ocontroller "github.com/openshift/library-go/pkg/controller"
+	"github.com/openshift/library-go/pkg/crypto"
 	"github.com/openshift/service-serving-cert-signer/pkg/controller/servingcert/cryptoextensions"
 )
 
@@ -65,6 +65,8 @@ type ServiceServingCertController struct {
 
 	ca        *crypto.CA
 	dnsSuffix string
+	// The intermediate to append to the serving certificate after rotation
+	intermediate []byte
 
 	// syncHandler does the work. It's factored out for unit testing
 	syncHandler func(serviceKey string) error
@@ -230,6 +232,8 @@ func (sc *ServiceServingCertController) syncService(key string) error {
 	dnsName := serviceCopy.Name + "." + serviceCopy.Namespace + ".svc"
 	fqDNSName := dnsName + "." + sc.dnsSuffix
 	certificateLifetime := 365 * 2 // 2 years
+
+	// TODO: Needs to create servingCert with an authKeyId
 	servingCert, err := sc.ca.MakeServerCert(
 		sets.NewString(dnsName, fqDNSName),
 		certificateLifetime,
@@ -242,6 +246,21 @@ func (sc *ServiceServingCertController) syncService(key string) error {
 	if err != nil {
 		return err
 	}
+
+	if len(sc.intermediate) == 0 {
+		// Check for a cross-signed intermediate from the CA key rotation process.
+		signingSecret, err := sc.secretLister.Secrets("openshift-service-cert-signer").Get("service-serving-cert-signer-signing-key")
+		if err != nil {
+			return err
+		}
+		if dat, ok := signingSecret.Data["intermediate.crt"]; ok {
+			sc.intermediate = make([]byte, len(dat))
+			copy(sc.intermediate, dat)
+		}
+	}
+	// Append the cross-signed intermediate if any. It goes after the end-entity certificate so servers send it along
+	// when serving.
+	certBytes = append(certBytes, sc.intermediate...)
 
 	secret := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
