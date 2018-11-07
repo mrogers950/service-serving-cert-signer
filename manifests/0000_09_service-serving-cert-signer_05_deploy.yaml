@@ -19,8 +19,8 @@ spec:
       serviceAccountName: openshift-service-cert-signer-operator
       containers:
       - name: operator
-        image: quay.io/openshift/origin-service-serving-cert-signer:latest
-        imagePullPolicy: IfNotPresent
+        image: docker.io/mrogers950/origin-service-serving-cert-signer:latest
+        imagePullPolicy: Always
         command: ["service-serving-cert-signer", "operator"]
         args:
         - "--config=/var/run/configmaps/config/operator-config.yaml"

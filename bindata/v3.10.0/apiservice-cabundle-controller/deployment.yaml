@@ -23,8 +23,8 @@ spec:
       serviceAccountName: apiservice-cabundle-injector-sa
       containers:
       - name: apiservice-cabundle-injector-controller
-        image: ${IMAGE}
-        imagePullPolicy: IfNotPresent
+        image: docker.io/mrogers950/origin-service-serving-cert-signer:latest
+        imagePullPolicy: Always
         command: ["service-serving-cert-signer", "apiservice-cabundle-injector"]
         args:
         - "--config=/var/run/configmaps/config/controller-config.yaml"

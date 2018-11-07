@@ -199,8 +199,8 @@ spec:
       serviceAccountName: apiservice-cabundle-injector-sa
       containers:
       - name: apiservice-cabundle-injector-controller
-        image: ${IMAGE}
-        imagePullPolicy: IfNotPresent
+        image: docker.io/mrogers950/origin-service-serving-cert-signer:latest
+        imagePullPolicy: Always
         command: ["service-serving-cert-signer", "apiservice-cabundle-injector"]
         args:
         - "--config=/var/run/configmaps/config/controller-config.yaml"
@@ -474,8 +474,8 @@ spec:
       serviceAccountName: configmap-cabundle-injector-sa
       containers:
       - name: configmap-cabundle-injector-controller
-        image: ${IMAGE}
-        imagePullPolicy: IfNotPresent
+        image: docker.io/mrogers950/origin-service-serving-cert-signer:latest
+        imagePullPolicy: Always
         command: ["service-serving-cert-signer", "configmap-cabundle-injector"]
         args:
         - "--config=/var/run/configmaps/config/controller-config.yaml"
@@ -499,9 +499,10 @@ spec:
       - name: config
         configMap:
           name: configmap-cabundle-injector-config
-
-
-
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+      tolerations:
+      - operator: Exists
 `)
 
 func v3100ConfigmapCabundleControllerDeploymentYamlBytes() ([]byte, error) {
@@ -765,8 +766,8 @@ spec:
       serviceAccountName: service-serving-cert-signer-sa
       containers:
       - name: service-serving-cert-signer-controller
-        image: ${IMAGE}
-        imagePullPolicy: IfNotPresent
+        image: docker.io/mrogers950/origin-service-serving-cert-signer:latest
+        imagePullPolicy: Always
         command: ["service-serving-cert-signer", "serving-cert-signer"]
         args:
         - "--config=/var/run/configmaps/config/controller-config.yaml"

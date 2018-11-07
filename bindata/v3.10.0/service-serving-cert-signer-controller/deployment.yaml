@@ -23,8 +23,8 @@ spec:
       serviceAccountName: service-serving-cert-signer-sa
       containers:
       - name: service-serving-cert-signer-controller
-        image: ${IMAGE}
-        imagePullPolicy: IfNotPresent
+        image: docker.io/mrogers950/origin-service-serving-cert-signer:latest
+        imagePullPolicy: Always
         command: ["service-serving-cert-signer", "serving-cert-signer"]
         args:
         - "--config=/var/run/configmaps/config/controller-config.yaml"
