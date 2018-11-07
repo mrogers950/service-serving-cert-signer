@@ -12,13 +12,25 @@ import (
 	appsclientv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	coreclientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"crypto"
+	crand "crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+
+	"crypto/x509/pkix"
+	"math/big"
+
 	operatorsv1alpha1 "github.com/openshift/api/operator/v1alpha1"
 	scsv1alpha1 "github.com/openshift/api/servicecertsigner/v1alpha1"
-	"github.com/openshift/library-go/pkg/crypto"
+	cryptohelpers "github.com/openshift/library-go/pkg/crypto"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceread"
 	"github.com/openshift/service-serving-cert-signer/pkg/operator/v310_00_assets"
+
+	"crypto/ecdsa"
+	"errors"
 )
 
 // syncSigningController_v311_00_to_latest takes care of synchronizing (not upgrading) the thing we're managing.
@@ -108,10 +120,77 @@ func manageSigningSecret_v311_00_to_latest(client coreclientv1.SecretsGetter) (*
 	secret := resourceread.ReadSecretV1OrDie(v310_00_assets.MustAsset("v3.10.0/service-serving-cert-signer-controller/signing-secret.yaml"))
 	existing, err := client.Secrets(secret.Namespace).Get(secret.Name, metav1.GetOptions{})
 	if !apierrors.IsNotFound(err) {
-		return existing, false, err
+		// Check the existing CA expiration to see if we need to do key rotation.
+		currentCACertPem, currentCAKeyPem, err := getCertSecretData(existing)
+		if err != nil {
+			return nil, false, err
+		}
+		currentCACert, err := parsePemCert(currentCACertPem)
+		if err != nil {
+			return nil, false, err
+		}
+		currentCAKey, err := parsePemKey(currentCAKeyPem)
+		if err != nil {
+			return nil, false, err
+		}
+
+		now := time.Now()
+		tilExpire := currentCACert.NotAfter.Sub(now)
+
+		halfExpiration := now.Add(time.Duration(tilExpire.Nanoseconds()/2) * time.Nanosecond)
+		if !now.After(halfExpiration) {
+			// Still time left.
+			return existing, false, nil
+		}
+
+		// Half of the CA expiration time has elapsed, go ahead and rotate.
+		// Create the new CA
+		newCACert, newCAKey, newCACertPem, newCAKeyPem, err := createServiceSigner(currentCACert.Subject, 356)
+		if err != nil {
+			return nil, false, err
+		}
+		// The first interim CA comprises of the old CA's public key, private key, and subject. It's self-issued but not
+		// self-signed as it's signed by the new CA key. This creates a trust bridge between refreshed clients and
+		// unrefreshed servers.
+		signedByNew, err := x509.CreateCertificate(crand.Reader, currentCACert, currentCACert, currentCACert.PublicKey, newCAKey)
+		if err != nil {
+			return nil, false, err
+		}
+
+		// The second interim CA comprises of the new CA's public key, private key, and subject. It's self-issued but not
+		// self-signed as it's signed by the old CA key. This creates a trust bridge between the unrefreshed clients and
+		// refreshed servers, as long as refreshed servers serve with a bundle containing this CA and the serving cert.
+		signedByOld, err := x509.CreateCertificate(crand.Reader, newCACert, newCACert, newCACert.PublicKey, currentCAKey)
+		if err != nil {
+			return nil, false, err
+		}
+
+		// Assemble bundle.
+		signedByNewPem, err := encodeASN1Cert(signedByNew)
+		if err != nil {
+			return nil, false, err
+		}
+
+		signedByOldPem, err := encodeASN1Cert(signedByOld)
+		if err != nil {
+			return nil, false, err
+		}
+
+		bundle := make([]byte, 0)
+		bundle = append(bundle, currentCACertPem...)
+		bundle = append(bundle, signedByNewPem...)
+		bundle = append(bundle, signedByOldPem...)
+		bundle = append(bundle, newCACertPem...)
+
+		secret.Data["tls.crt"] = newCACertPem
+		secret.Data["tls.key"] = newCAKeyPem
+		secret.Data["intermediate.crt"] = signedByOldPem
+		secret.Data["cabundle.crt"] = bundle
+
+		return resourceapply.ApplySecret(client, secret)
 	}
 
-	ca, err := crypto.MakeCAConfig(serviceServingCertSignerName(), 10)
+	ca, err := cryptohelpers.MakeCAConfig(serviceServingCertSignerName(), 10)
 	if err != nil {
 		return existing, false, err
 	}
@@ -126,6 +205,122 @@ func manageSigningSecret_v311_00_to_latest(client coreclientv1.SecretsGetter) (*
 	secret.Data["tls.key"] = keyBytes.Bytes()
 
 	return resourceapply.ApplySecret(client, secret)
+}
+
+func encodeASN1Cert(certDer []byte) ([]byte, error) {
+	b := bytes.Buffer{}
+	err := pem.Encode(&b, &pem.Block{Type: "CERTIFICATE", Bytes: certDer})
+	if err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
+}
+
+func createServiceSigner(caSubject pkix.Name, days int) (*x509.Certificate, crypto.PrivateKey, []byte, []byte, error) {
+	// XXX set subjectKeyId
+	replacementCATemplate := &x509.Certificate{
+		Subject: caSubject,
+
+		SignatureAlgorithm: x509.SHA256WithRSA,
+
+		NotBefore:    time.Now().Add(-1 * time.Second),
+		NotAfter:     time.Now().Add(time.Duration(days) * 24 * time.Hour),
+		SerialNumber: big.NewInt(1),
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA: true,
+	}
+
+	replacementCAPublicKey, replacementCAPrivateKey, err := cryptohelpers.NewKeyPair()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	replacementDer, err := x509.CreateCertificate(crand.Reader, replacementCATemplate, replacementCATemplate, replacementCAPublicKey, replacementCAPrivateKey)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	replacementCert, err := x509.ParseCertificates(replacementDer)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if len(replacementCert) != 1 {
+		return nil, nil, nil, nil, fmt.Errorf("Expected one certificate")
+	}
+
+	caPem, err := encodeCertificates(replacementCert...)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	caKey, err := encodeKey(replacementCAPrivateKey)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	return replacementCert[0], replacementCAPrivateKey, caPem, caKey, nil
+}
+
+func encodeCertificates(certs ...*x509.Certificate) ([]byte, error) {
+	b := bytes.Buffer{}
+	for _, cert := range certs {
+		if err := pem.Encode(&b, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil {
+			return []byte{}, err
+		}
+	}
+	return b.Bytes(), nil
+}
+
+func encodeKey(key crypto.PrivateKey) ([]byte, error) {
+	b := bytes.Buffer{}
+	switch key := key.(type) {
+	case *ecdsa.PrivateKey:
+		keyBytes, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			return []byte{}, err
+		}
+		if err := pem.Encode(&b, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}); err != nil {
+			return b.Bytes(), err
+		}
+	case *rsa.PrivateKey:
+		if err := pem.Encode(&b, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
+			return []byte{}, err
+		}
+	default:
+		return []byte{}, errors.New("Unrecognized key type")
+
+	}
+	return b.Bytes(), nil
+}
+
+func getCertSecretData(secret *corev1.Secret) ([]byte, []byte, error) {
+	cert, ok := secret.Data["tls.crt"]
+	if !ok || len(cert) == 0 {
+		return nil, nil, fmt.Errorf("secret %s does not contain cert data", secret.Name)
+	}
+	key, ok := secret.Data["tls.key"]
+	if !ok || len(key) == 0 {
+		return nil, nil, fmt.Errorf("secret %s does not contain key data", secret.Name)
+	}
+	return cert, key, nil
+}
+
+func parsePemCert(certPem []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(certPem)
+	if block == nil {
+		return nil, fmt.Errorf("error parsing certificate pem")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+func parsePemKey(keyPem []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(keyPem)
+	if block == nil {
+		return nil, fmt.Errorf("error parsing key pem")
+	}
+	return x509.ParsePKCS1PrivateKey(block.Bytes)
 }
 
 func manageSignerDeployment_v311_00_to_latest(client appsclientv1.DeploymentsGetter, options *scsv1alpha1.ServiceCertSignerOperatorConfig, previousAvailability *operatorsv1alpha1.VersionAvailability, forceDeployment bool) (*appsv1.Deployment, bool, error) {

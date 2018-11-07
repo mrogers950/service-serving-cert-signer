@@ -10,6 +10,8 @@ import (
 	appsclientv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	coreclientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"bytes"
+
 	operatorsv1alpha1 "github.com/openshift/api/operator/v1alpha1"
 	scsv1alpha1 "github.com/openshift/api/servicecertsigner/v1alpha1"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
@@ -113,7 +115,27 @@ func manageSigningCABundle(client coreclientv1.CoreV1Interface) (*corev1.ConfigM
 	configMap := resourceread.ReadConfigMapV1OrDie(v310_00_assets.MustAsset("v3.10.0/apiservice-cabundle-controller/signing-cabundle.yaml"))
 	existing, err := client.ConfigMaps(configMap.Namespace).Get(configMap.Name, metav1.GetOptions{})
 	if !apierrors.IsNotFound(err) {
-		return existing, false, err
+		// Check the signing secret for an updated bundle
+		secret := resourceread.ReadSecretV1OrDie(v310_00_assets.MustAsset("v3.10.0/service-serving-cert-signer-controller/signing-secret.yaml"))
+		currentSigningKeySecret, err := client.Secrets(secret.Namespace).Get(secret.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return existing, false, err
+		}
+		if err != nil {
+			return existing, false, err
+		}
+		bundle, ok := currentSigningKeySecret.Data["cabundle.crt"]
+		if !ok {
+			// No signing bundle, return the existing one
+			return existing, false, nil
+		}
+		if bytes.Equal(bundle, []byte(existing.Data["cabundle.crt"])) {
+			// Not updated, return
+			return existing, false, nil
+		}
+		configMap.Data["cabundle.crt"] = string(bundle)
+
+		return resourceapply.ApplyConfigMap(client, configMap)
 	}
 
 	secret := resourceread.ReadSecretV1OrDie(v310_00_assets.MustAsset("v3.10.0/service-serving-cert-signer-controller/signing-secret.yaml"))
