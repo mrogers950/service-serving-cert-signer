@@ -191,6 +191,7 @@ func manageSigningSecret_v311_00_to_latest(client coreclientv1.SecretsGetter) (*
 		secret.Data["intermediate.crt"] = signedByOldPem
 		secret.Data["cabundle.crt"] = bundle
 
+		glog.Info("DBG: applying new secrets")
 		return resourceapply.ApplySecret(client, secret)
 	}
 

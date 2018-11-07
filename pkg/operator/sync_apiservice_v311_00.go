@@ -12,6 +12,7 @@ import (
 
 	"bytes"
 
+	"github.com/golang/glog"
 	operatorsv1alpha1 "github.com/openshift/api/operator/v1alpha1"
 	scsv1alpha1 "github.com/openshift/api/servicecertsigner/v1alpha1"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
@@ -116,6 +117,8 @@ func manageSigningCABundle(client coreclientv1.CoreV1Interface) (*corev1.ConfigM
 	existing, err := client.ConfigMaps(configMap.Namespace).Get(configMap.Name, metav1.GetOptions{})
 	if !apierrors.IsNotFound(err) {
 		// Check the signing secret for an updated bundle
+		glog.Info("DBG: apisv seeing if we should update the bundle")
+
 		secret := resourceread.ReadSecretV1OrDie(v310_00_assets.MustAsset("v3.10.0/service-serving-cert-signer-controller/signing-secret.yaml"))
 		currentSigningKeySecret, err := client.Secrets(secret.Namespace).Get(secret.Name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
@@ -127,14 +130,19 @@ func manageSigningCABundle(client coreclientv1.CoreV1Interface) (*corev1.ConfigM
 		bundle, ok := currentSigningKeySecret.Data["cabundle.crt"]
 		if !ok {
 			// No signing bundle, return the existing one
+			glog.Info("DBG: apisv no signing bundle")
+
 			return existing, false, nil
 		}
 		if bytes.Equal(bundle, []byte(existing.Data["cabundle.crt"])) {
 			// Not updated, return
+			glog.Info("DBG: apisv no new signing bundle")
+
 			return existing, false, nil
 		}
 		configMap.Data["cabundle.crt"] = string(bundle)
 
+		glog.Info("DBG: apisv updated new configmap bundle")
 		return resourceapply.ApplyConfigMap(client, configMap)
 	}
 

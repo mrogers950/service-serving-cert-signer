@@ -137,7 +137,7 @@ func pollForServiceServingSecret(client *kubernetes.Clientset, secretName, names
 func pollForNewCert(client *kubernetes.Clientset, ns, secretName string, certPem, keyPem []byte) ([]byte, []byte, error) {
 	var returnCertPem []byte
 	var returnKeyPem []byte
-	pollErr := wait.PollImmediate(time.Second, 50*time.Second, func() (bool, error) {
+	pollErr := wait.PollImmediate(time.Second, 150*time.Second, func() (bool, error) {
 		s, err := client.CoreV1().Secrets(ns).Get(secretName, metav1.GetOptions{})
 		if err != nil && kapierrors.IsNotFound(err) {
 			return false, nil
@@ -165,7 +165,7 @@ func pollForNewCert(client *kubernetes.Clientset, ns, secretName string, certPem
 
 func pollForNewCABundleData(client *kubernetes.Clientset, ns, configMapName string, bundle []byte) ([]byte, error) {
 	var returnBundle []byte
-	pollErr := wait.PollImmediate(time.Second, 50*time.Second, func() (bool, error) {
+	pollErr := wait.PollImmediate(time.Second, 150*time.Second, func() (bool, error) {
 		cm, err := client.CoreV1().ConfigMaps(ns).Get(configMapName, metav1.GetOptions{})
 		if err != nil && kapierrors.IsNotFound(err) {
 			return false, nil
@@ -175,7 +175,7 @@ func pollForNewCABundleData(client *kubernetes.Clientset, ns, configMapName stri
 			return false, err
 		}
 
-		data := cm.Data["cabundle.crt"]
+		data := cm.Data["service-ca.crt"]
 		if len(data) == 0 {
 			return false, nil
 		}
@@ -201,7 +201,7 @@ func pollForBundleConfigMapData(client *kubernetes.Clientset, configMapName, nam
 		if err != nil {
 			return false, err
 		}
-		data, ok := cm.Data["cabundle.crt"]
+		data, ok := cm.Data["service-ca.crt"]
 		if !ok || len(data) == 0 {
 			return false, err
 		}
@@ -282,7 +282,7 @@ func TestE2E(t *testing.T) {
 		testServiceName := "test-service-" + randSeq(5)
 		testSecretName := "test-secret-" + randSeq(5)
 		testConfigMapName := "test-configmap-" + randSeq(5)
-		defer cleanupServiceSignerTestObjects(adminClient, testSecretName, testServiceName, ns.Name)
+		//defer cleanupServiceSignerTestObjects(adminClient, testSecretName, testServiceName, ns.Name)
 
 		err = createServingCertAnnotatedService(adminClient, testSecretName, testServiceName, ns.Name)
 		if err != nil {
