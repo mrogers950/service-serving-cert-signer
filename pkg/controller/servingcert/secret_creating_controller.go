@@ -124,6 +124,7 @@ func (sc *ServiceServingCertController) Run(workers int, stopCh <-chan struct{})
 	defer utilruntime.HandleCrash()
 	defer sc.queue.ShutDown()
 
+	glog.Info("DBG: now running")
 	if !cache.WaitForCacheSync(stopCh, sc.serviceHasSynced, sc.secretHasSynced) {
 		return
 	}
