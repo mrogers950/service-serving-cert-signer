@@ -31,6 +31,8 @@ import (
 
 	"crypto/ecdsa"
 	"errors"
+
+	"github.com/golang/glog"
 )
 
 // syncSigningController_v311_00_to_latest takes care of synchronizing (not upgrading) the thing we're managing.
@@ -140,9 +142,11 @@ func manageSigningSecret_v311_00_to_latest(client coreclientv1.SecretsGetter) (*
 		halfExpiration := now.Add(time.Duration(tilExpire.Nanoseconds()/2) * time.Nanosecond)
 		if !now.After(halfExpiration) {
 			// Still time left.
+			glog.Infof("DBG: determined that time is left on cert: %v", currentCACert.NotAfter.String())
 			return existing, false, nil
 		}
 
+		glog.Infof("DBG: determined that we rotate")
 		// Half of the CA expiration time has elapsed, go ahead and rotate.
 		// Create the new CA
 		newCACert, newCAKey, newCACertPem, newCAKeyPem, err := createServiceSigner(currentCACert.Subject, 356)
