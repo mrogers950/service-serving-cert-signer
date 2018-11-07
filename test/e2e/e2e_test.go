@@ -1,9 +1,16 @@
 package e2e
 
 import (
+	"bytes"
 	"crypto"
+	"crypto/ecdsa"
 	crand "crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"math/big"
 	"math/rand"
 	"os"
 	"strings"
@@ -16,17 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-
-	"bytes"
-	"crypto/ecdsa"
-	"crypto/rsa"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"fmt"
-	"math/big"
-
-	"io/ioutil"
 
 	cryptohelpers "github.com/openshift/library-go/pkg/crypto"
 	"github.com/openshift/service-serving-cert-signer/pkg/controller/servingcert"
@@ -88,39 +84,131 @@ func createServingCertAnnotatedService(client *kubernetes.Clientset, secretName,
 	return err
 }
 
-func getTLSCredsFromSecret(client *kubernetes.Clientset, secretName, namespace, certDataKey, keyDataKey string) ([]byte, []byte, error) {
-	secret, err := client.CoreV1().Secrets(namespace).Get(secretName, metav1.GetOptions{})
-	if err != nil {
-		return nil, nil, err
-	}
-	certData, ok := secret.Data[certDataKey]
-	if !ok {
-		return nil, nil, fmt.Errorf("secret %s does not have data key %s", secret.Name, certDataKey)
-	}
-	if len(certData) == 0 {
-		return nil, nil, fmt.Errorf("secret %s does not contain cert data", secret.Name)
-	}
-	keyData, ok := secret.Data[keyDataKey]
-	if !ok {
-		return nil, nil, fmt.Errorf("secret %s does not have data key %s", secret.Name, keyDataKey)
-	}
-	if len(keyData) == 0 {
-		return nil, nil, fmt.Errorf("secret %s does not contain key data", secret.Name)
-	}
-	return certData, keyData, nil
+func createCABundleConfigMap(client *kubernetes.Clientset, configMapName, namespace string) error {
+	_, err := client.CoreV1().ConfigMaps(namespace).Create(&v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: configMapName,
+			Annotations: map[string]string{
+				"service.alpha.openshift.io/inject-cabundle": "true",
+			},
+		},
+	})
+	return err
 }
 
-func pollForServiceServingSecret(client *kubernetes.Clientset, secretName, namespace string) error {
-	return wait.PollImmediate(time.Second, 10*time.Second, func() (bool, error) {
-		_, err := client.CoreV1().Secrets(namespace).Get(secretName, metav1.GetOptions{})
+//func getTLSCredsFromSecret(client *kubernetes.Clientset, secretName, namespace, certDataKey, keyDataKey string) ([]byte, []byte, error) {
+//	secret, err := client.CoreV1().Secrets(namespace).Get(secretName, metav1.GetOptions{})
+//	if err != nil {
+//		return nil, nil, err
+//	}
+//	certData, ok := secret.Data[certDataKey]
+//	if !ok {
+//		return nil, nil, fmt.Errorf("secret %s does not have data key %s", secret.Name, certDataKey)
+//	}
+//	if len(certData) == 0 {
+//		return nil, nil, fmt.Errorf("secret %s does not contain cert data", secret.Name)
+//	}
+//	keyData, ok := secret.Data[keyDataKey]
+//	if !ok {
+//		return nil, nil, fmt.Errorf("secret %s does not have data key %s", secret.Name, keyDataKey)
+//	}
+//	if len(keyData) == 0 {
+//		return nil, nil, fmt.Errorf("secret %s does not contain key data", secret.Name)
+//	}
+//	return certData, keyData, nil
+//}
+
+func pollForServiceServingSecret(client *kubernetes.Clientset, secretName, namespace string) (*v1.Secret, error) {
+	var secret *v1.Secret
+	pollErr := wait.PollImmediate(time.Second, 10*time.Second, func() (bool, error) {
+		s, err := client.CoreV1().Secrets(namespace).Get(secretName, metav1.GetOptions{})
 		if err != nil && kapierrors.IsNotFound(err) {
 			return false, nil
 		}
 		if err != nil {
 			return false, err
 		}
+		secret = s
 		return true, nil
 	})
+	return secret, pollErr
+}
+func pollForNewCert(client *kubernetes.Clientset, ns, secretName string, certPem, keyPem []byte) ([]byte, []byte, error) {
+	var returnCertPem []byte
+	var returnKeyPem []byte
+	pollErr := wait.PollImmediate(time.Second, 50*time.Second, func() (bool, error) {
+		s, err := client.CoreV1().Secrets(ns).Get(secretName, metav1.GetOptions{})
+		if err != nil && kapierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		if err != nil {
+			return false, err
+		}
+
+		c, k := s.Data["tls.crt"], s.Data["tls.key"]
+		if len(c) == 0 || len(k) == 0 {
+			return false, nil
+		}
+
+		if bytes.Equal(c, certPem) && bytes.Equal(k, keyPem) {
+			return false, nil
+		}
+
+		returnCertPem = c
+		returnKeyPem = k
+		return true, nil
+	})
+	return returnCertPem, returnKeyPem, pollErr
+}
+
+func pollForNewCABundleData(client *kubernetes.Clientset, ns, configMapName string, bundle []byte) ([]byte, error) {
+	var returnBundle []byte
+	pollErr := wait.PollImmediate(time.Second, 50*time.Second, func() (bool, error) {
+		cm, err := client.CoreV1().ConfigMaps(ns).Get(configMapName, metav1.GetOptions{})
+		if err != nil && kapierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		if err != nil {
+			return false, err
+		}
+
+		data := cm.Data["cabundle.crt"]
+		if len(data) == 0 {
+			return false, nil
+		}
+		dataBytes := []byte(data)
+
+		if bytes.Equal(dataBytes, bundle) {
+			return false, nil
+		}
+
+		returnBundle = dataBytes
+		return true, nil
+	})
+	return returnBundle, pollErr
+}
+
+func pollForBundleConfigMapData(client *kubernetes.Clientset, configMapName, namespace string) ([]byte, error) {
+	var returnData []byte
+	pollErr := wait.PollImmediate(time.Second, 10*time.Second, func() (bool, error) {
+		cm, err := client.CoreV1().ConfigMaps(namespace).Get(configMapName, metav1.GetOptions{})
+		if err != nil && kapierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		data, ok := cm.Data["cabundle.crt"]
+		if !ok || len(data) == 0 {
+			return false, err
+		}
+		returnData = []byte(data)
+		return true, nil
+	})
+	return returnData, pollErr
 }
 
 func cleanupServiceSignerTestObjects(client *kubernetes.Clientset, secretName, serviceName, namespace string) {
@@ -180,7 +268,7 @@ func TestE2E(t *testing.T) {
 			t.Fatalf("error creating annotated service: %v", err)
 		}
 
-		err = pollForServiceServingSecret(adminClient, testSecretName, ns.Name)
+		_, err = pollForServiceServingSecret(adminClient, testSecretName, ns.Name)
 		if err != nil {
 			t.Fatalf("error fetching created serving cert secret: %v", err)
 		}
@@ -193,6 +281,7 @@ func TestE2E(t *testing.T) {
 		}
 		testServiceName := "test-service-" + randSeq(5)
 		testSecretName := "test-secret-" + randSeq(5)
+		testConfigMapName := "test-configmap-" + randSeq(5)
 		defer cleanupServiceSignerTestObjects(adminClient, testSecretName, testServiceName, ns.Name)
 
 		err = createServingCertAnnotatedService(adminClient, testSecretName, testServiceName, ns.Name)
@@ -200,42 +289,86 @@ func TestE2E(t *testing.T) {
 			t.Fatalf("error creating annotated service: %v", err)
 		}
 
-		err = pollForServiceServingSecret(adminClient, testSecretName, ns.Name)
+		servingSecret, err := pollForServiceServingSecret(adminClient, testSecretName, ns.Name)
 		if err != nil {
 			t.Fatalf("error fetching created serving cert secret: %v", err)
 		}
 
-		//currentServingCert, currentServingKey, err := getTLSCredsFromSecret(adminClient, testSecretName, ns.Name, "tls.crt", "tls.key")
+		err = createCABundleConfigMap(adminClient, testConfigMapName, ns.Name)
+		if err != nil {
+			t.Fatalf("error creating cabundle configmap")
+		}
+
+		// get configmap bundle , bundle A
+		bundle, err := pollForBundleConfigMapData(adminClient, testConfigMapName, ns.Name)
+		if err != nil {
+			t.Fatalf("error fetching cabundle configmap")
+		}
+
+		// get serving cert and key from secret -> server cert X and server key X
+		servingCertPem := servingSecret.Data["tls.crt"]
+		servingKeyPem := servingSecret.Data["tls.crt"]
+
+		// replace service signer cert with one about to expire
+		err = replaceServiceCA(adminClient)
+		if err != nil {
+			t.Fatalf("error replacing service CA")
+		}
+
+		// fetch new configmap bundle until its different from bundle A. This is bundle B, bundle rotation has happened
+		newConfigMapBundleData, err := pollForNewCABundleData(adminClient, ns.Name, testConfigMapName, bundle)
+		if err != nil {
+			t.Fatalf("error polling for new ca bundle data")
+		}
+		fmt.Println("original bundle:")
+		fmt.Println(string(bundle))
+		fmt.Println("replaced bundle:")
+		fmt.Println(string(newConfigMapBundleData))
+
+		// fetch new signer cert until it's different from cert x, this is cert y -> server rotation has happened
+		// ensure it has bundle
+		newServingCertPem, newServingKeyPem, err := pollForNewCert(adminClient, ns.Name, testSecretName, servingCertPem, servingKeyPem)
+		if err != nil {
+			t.Fatalf("error polling for new signer cert")
+		}
+
+		fmt.Println("original server cert:")
+		fmt.Println(servingCertPem)
+		fmt.Println("original serving key:")
+		fmt.Println(string(servingKeyPem))
+
+		fmt.Println("replaced serving cert:")
+		fmt.Println(string(newServingCertPem))
+		fmt.Println("replaced serving key:")
+		fmt.Println(string(newServingKeyPem))
+
+		//// ensure it has 4 certs
+		//err := verifyCABundleData(newConfigMapBundleData)
 		//if err != nil {
-		//	t.Fatalf("error fetching serving cert: %v", err)
+		//	t.Fatalf("error verifying bundle data")
 		//}
-
-		replacementSubject, err := getSigningSubject(adminClient)
-		if err != nil {
-			t.Fatalf("error fetching signing key subject: %v", err)
-		}
-
-		err = createServiceSignerReplacementCASecret(adminClient, replacementSubject, 100)
-		if err != nil {
-			t.Fatalf("error creating replacement ca: %v", err)
-		}
-
-		// make sure it's created
-		err = pollForServiceServingSecret(adminClient, "next-service-signer", "openshift-service-cert-signer")
-		if err != nil {
-			t.Fatalf("error fetching replacement CA secret")
-		}
-		defer adminClient.CoreV1().Secrets("openshift-service-cert-signer").Delete("next-service-signer", nil)
-
-		_, _, err = CreateCrossSignedInterimCAs(adminClient,
-			"service-serving-cert-signer-signing-key",
-			"openshift-service-cert-signer",
-			"next-service-signer",
-			"openshift-service-cert-signer",
-		)
-		if err != nil {
-			t.Fatalf("error creating cross-signed certs: %v", err)
-		}
+		//
+		//// tests are:
+		//// serve cert X and client A
+		//err = testServiceServingCertAndBundle(servingCertPem, servingKeyPem, bundle)
+		//if err != nil {
+		//	t.Fatalf("error verifying old serving cert with old bundle")
+		//}
+		//// serve cert y + intermediate with client A
+		//err = testServiceServingCertAndBundle(newServingCertPem, newServingKeyPem, bundle)
+		//if err != nil {
+		//	t.Fatalf("error verifying new serving certs with old bundle")
+		//}
+		//// serve cert X and client bundle B
+		//err = testServiceServingCertAndBundle(servingCertPem, servingKeyPem, newConfigMapBundleData)
+		//if err != nil {
+		//	t.Fatalf("error verifying old serving cert with new bundle")
+		//}
+		//// serve cert y + intermediate with client bundle B
+		//err = testServiceServingCertAndBundle(newServingCertPem, newServingKeyPem, newConfigMapBundleData)
+		//if err != nil {
+		//	t.Fatalf("error verifying new serving cert with new bundle")
+		//}
 
 	})
 	// TODO: additional tests
@@ -244,6 +377,7 @@ func TestE2E(t *testing.T) {
 	// - regenerate serving cert
 }
 
+/*
 func getSigningSubject(client *kubernetes.Clientset) (pkix.Name, error) {
 	currentCASecret, err := client.CoreV1().Secrets("openshift-service-cert-signer").Get("service-serving-cert-signer-signing-key", metav1.GetOptions{})
 	if err != nil {
@@ -357,18 +491,25 @@ func CreateCrossSignedInterimCAs(client *kubernetes.Clientset, currentCASecretNa
 
 	return firstCrossSignedCApem, secondCrossSignedCApem, nil
 }
+*/
+func replaceServiceCA(adminClient *kubernetes.Clientset) error {
+	currentCA, err := adminClient.CoreV1().Secrets(serviceCAControllerNamespace).Get("service-serving-cert-signer-signing-key", metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
 
-func createServiceSignerReplacementCASecret(adminClient *kubernetes.Clientset, caSubject pkix.Name, days int) error {
-	// XXX set subjectKeyId
+	certs, err := cryptohelpers.CertsFromPEM(currentCA.Data["tls.crt"])
+	if err != nil {
+		return err
+	}
+	cert := certs[0]
+
 	replacementCATemplate := &x509.Certificate{
-		Subject: caSubject,
-
-		SignatureAlgorithm: x509.SHA256WithRSA,
-
-		NotBefore:    time.Now().Add(-1 * time.Second),
-		NotAfter:     time.Now().Add(time.Duration(days) * 24 * time.Hour),
-		SerialNumber: big.NewInt(1),
-
+		Subject:               cert.Subject,
+		SignatureAlgorithm:    x509.SHA256WithRSA,
+		NotBefore:             time.Now().Add(-1 * time.Second),
+		NotAfter:              time.Now().Add(2 * time.Minute),
+		SerialNumber:          big.NewInt(1),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 		IsCA: true,
@@ -402,16 +543,10 @@ func createServiceSignerReplacementCASecret(adminClient *kubernetes.Clientset, c
 		return err
 	}
 
-	_, err = adminClient.CoreV1().Secrets("openshift-service-cert-signer").Create(&v1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "next-service-signer",
-		},
-		Data: map[string][]byte{
-			"tls.crt": caPem,
-			"tls.key": caKey,
-		},
-		Type: "kubernetes.io/tls",
-	})
+	currentCA.Data["tls.crt"] = caPem
+	currentCA.Data["tls.key"] = caKey
+
+	_, err = adminClient.CoreV1().Secrets(currentCA.Namespace).Update(currentCA)
 	return err
 }
 
